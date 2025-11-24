@@ -1,7 +1,7 @@
 import json
 import os
 from web3 import Web3
-from .web3_client import w3
+from .web3_client import w3, is_rpc_connected
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ABI_DIR = os.path.join(BASE_DIR, "abis")
@@ -14,11 +14,13 @@ CONTRACT_ADDRESSES = {
 }
 
 def load_contract(name: str):
-    """Load contract from ABI and address."""
     abi_path = os.path.join(ABI_DIR, f"{name}.json")
 
-    with open(abi_path, 'r') as f:
+    with open(abi_path, "r") as f:
         abi = json.load(f)
+
+    if not is_rpc_connected():
+        raise Exception("RPC unavailable. Try again.")
 
     address = Web3.to_checksum_address(CONTRACT_ADDRESSES[name])
 

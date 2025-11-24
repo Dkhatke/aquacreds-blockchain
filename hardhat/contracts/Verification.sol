@@ -8,7 +8,7 @@ contract Verification {
     ProjectRegistry public registry;
     address public verifier;     // single authorized verifier address
 
-    uint256 public constant LOCK_PERIOD = 365 days;  // 1-year wait before credits can be minted
+    uint256 public constant LOCK_PERIOD = 0 ;  // 1-year wait before credits can be minted
 
     struct MRVData {
         string projectId;
