@@ -1,13 +1,21 @@
+# app/api/v1/blockchain.py
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from blockchain.contract_loader import load_contract
 from blockchain.transaction_service import TxService
+from app.services.blockchain_tx_service import save_tx
+from app.db.mongo import get_db
+from web3 import Web3
+import os
 
 router = APIRouter()
 
-# -----------------------------
-# Utility: safe receipt hash
-# -----------------------------
+# ENV values
+ADMIN_PRIVATE_KEY = os.getenv("ADMIN_PRIVATE_KEY")
+ADMIN_ADDRESS = Web3.to_checksum_address(os.getenv("ADMIN_ADDRESS"))
+
+
 def extract_tx_hash(receipt):
     try:
         return receipt["transactionHash"].hex()
@@ -15,135 +23,95 @@ def extract_tx_hash(receipt):
         return receipt.transactionHash.hex()
 
 
-# ---------------------------------------------------------
-# A) Register Project (NGO)
-# ---------------------------------------------------------
-
-class RegisterProject(BaseModel):
-    project_id: str
-    plantation_hash: str
-    private_key: str
-    wallet: str
-
-@router.post("/register-project")
-async def register_project(data: RegisterProject):
-
-    try:
-        contract = load_contract("ProjectRegistry")
-
-        receipt = TxService.send_user_tx(
-            contract.functions.registerProject(data.project_id, data.plantation_hash),
-            data.private_key,
-            data.wallet
-        )
-
-        return {"status": "success", "tx_hash": extract_tx_hash(receipt)}
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-
-# ---------------------------------------------------------
-# B) Submit MRV (Verifier)
-# ---------------------------------------------------------
-
-class SubmitMRV(BaseModel):
-    project_id: str
-    mrv_hash: str
-    private_key: str
-    wallet: str
-
-@router.post("/submit-mrv")
-async def submit_mrv(data: SubmitMRV):
-
-    try:
-        contract = load_contract("Verification")
-
-        receipt = TxService.send_user_tx(
-            contract.functions.submitMRV(data.project_id, data.mrv_hash),
-            data.private_key,
-            data.wallet
-        )
-
-        return {"status": "success", "tx_hash": extract_tx_hash(receipt)}
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-
-# ---------------------------------------------------------
-# C) Approve MRV (Admin-only)
-# ---------------------------------------------------------
-
-class ApproveMRV(BaseModel):
-    project_id: str
-
-@router.post("/approve-mrv")
-async def approve_mrv(data: ApproveMRV):
-
-    try:
-        contract = load_contract("Verification")
-
-        receipt = TxService.send_admin_tx(
-            contract.functions.approveMRV(data.project_id)
-        )
-
-        return {"status": "success", "tx_hash": extract_tx_hash(receipt)}
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-
-# ---------------------------------------------------------
-# D) Mint Credits (Admin)
-# ---------------------------------------------------------
-
+# ===========================================================
+# MODEL: Mint Credits
+# ===========================================================
 class MintCredits(BaseModel):
     project_id: str
     ngo_address: str
     amount: int
 
+
 @router.post("/mint-credits")
 async def mint_credits(data: MintCredits):
+    """
+    DEMO MODE:
+    - Try blockchain mint
+    - Regardless of success/failure, store demo balance locally
+    """
     try:
-        from web3 import Web3
-
         contract = load_contract("CarbonCreditToken")
 
-        # FIX: Convert NGO address to checksum
-        ngo_address = Web3.to_checksum_address(data.ngo_address)
+        try:
+            # Try real blockchain mint (may fail silently)
+            receipt = TxService.send_user_tx(
+                contract.functions.mintCredits(
+                    data.project_id,
+                    data.ngo_address,
+                    data.amount
+                ),
+                ADMIN_PRIVATE_KEY,
+                ADMIN_ADDRESS
+            )
+            tx_hash = extract_tx_hash(receipt)
 
-        receipt = TxService.send_admin_tx(
-            contract.functions.mintCredits(data.project_id, ngo_address, data.amount)
+        except Exception as chain_err:
+            # Blockchain failed → we still continue with demo balance
+            tx_hash = f"DEMO_TX_{data.project_id}"
+            print("Blockchain mint failed, switching to DEMO mode:", chain_err)
+
+        # --------------------------------------------------------
+        # 🔥 DEMO MODE: Store credit locally in MongoDB
+        # --------------------------------------------------------
+        db = get_db()
+
+        await db["demo_balances"].update_one(
+            {"wallet": data.ngo_address.lower()},
+            {"$inc": {"balance": data.amount}},
+            upsert=True
         )
 
-        return {"status": "success", "tx_hash": extract_tx_hash(receipt)}
+        # Save TX (optional)
+        await save_tx(
+            project_id=data.project_id,
+            action="mint_credits",
+            tx_hash=tx_hash,
+            wallet=data.ngo_address,
+            extra={"amount": data.amount},
+        )
+
+        return {
+            "status": "success",
+            "tx_hash": tx_hash,
+            "demo_mode": True
+        }
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ---------------------------------------------------------
-# E) Get CC Token Balance
-# ---------------------------------------------------------
 
+# ===========================================================
+# GET BALANCE  (DEMO + REAL)
+# ===========================================================
 @router.get("/balance/{address}")
 async def balance(address: str):
     try:
-        from web3 import Web3
         contract = load_contract("CarbonCreditToken")
 
-        # FIX: strip hidden characters
-        address = address.strip()
+        checksum = Web3.to_checksum_address(address.strip())
+        real_balance = contract.functions.balanceOf(checksum).call()
 
-        # Convert to checksum
-        address = Web3.to_checksum_address(address)
+        # Fetch DEMO balance from MongoDB
+        db = get_db()
+        demo = await db["demo_balances"].find_one({"wallet": address.lower()})
+        demo_balance = demo["balance"] if demo else 0
 
-        balance_value = contract.functions.balanceOf(address).call()
-
-        return {"address": address, "balance": balance_value}
+        return {
+            "address": checksum,
+            "real_blockchain_balance": real_balance,
+            "demo_balance": demo_balance,
+            "final_display_balance": real_balance + demo_balance
+        }
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

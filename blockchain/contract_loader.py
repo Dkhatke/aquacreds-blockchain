@@ -1,27 +1,29 @@
+# blockchain/contract_loader.py
+
 import json
 import os
 from web3 import Web3
-from .web3_client import w3, is_rpc_connected
+from .web3_client import w3   # <-- FIXED: remove is_rpc_connected
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ABI_DIR = os.path.join(BASE_DIR, "abis")
+ARTIFACTS_DIR = os.path.join(os.path.dirname(__file__), "abis")
 
-CONTRACT_ADDRESSES = {
-    "ProjectRegistry": "0x8B490286f95ffFBED0Eb66a52b6dA508cECD07CC",
-    "Verification": "0xcd69AB04Ae9Dc58025052e9fC4E20BDf7Ea837aa",
-    "CarbonCreditToken": "0x3FF4eBD81C36C4eB4C4748841F750542e0392fe9",
-    "Marketplace": "0x2D7651aDB253e1E145167241fa367a230ccE3bd8"
-}
 
-def load_contract(name: str):
-    abi_path = os.path.join(ABI_DIR, f"{name}.json")
+def load_contract(contract_name: str):
+    try:
+        json_path = os.path.join(ARTIFACTS_DIR, f"{contract_name}.json")
 
-    with open(abi_path, "r") as f:
-        abi = json.load(f)
+        if not os.path.exists(json_path):
+            raise Exception(f"Contract artifact not found: {json_path}")
 
-    if not is_rpc_connected():
-        raise Exception("RPC unavailable. Try again.")
+        with open(json_path, "r") as f:
+            artifact = json.load(f)
 
-    address = Web3.to_checksum_address(CONTRACT_ADDRESSES[name])
+        address = artifact["address"]
+        abi = artifact["abi"]
 
-    return w3.eth.contract(address=address, abi=abi)
+        return w3.eth.contract(
+            address=Web3.to_checksum_address(address),
+            abi=abi
+        )
+    except Exception as e:
+        raise Exception(f"Failed to load contract {contract_name}: {e}")
