@@ -1,3 +1,4 @@
+# app/models/collections.py
 # simple names to avoid typos across code
 USERS_COLL = "users"
 PROJECTS_COLL = "projects"

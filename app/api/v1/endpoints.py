@@ -1,3 +1,4 @@
+# app/api/v1/endpoints.py
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from app.utils.hashing import sha256_bytes
 from app.utils.exif_utils import extract_exif

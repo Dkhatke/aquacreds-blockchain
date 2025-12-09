@@ -21,6 +21,9 @@ if (config.env !== 'test') {
   app.use(morgan.errorHandler);
 }
 
+
+
+
 // set security HTTP headers
 app.use(helmet());
 
@@ -45,6 +48,10 @@ app.options('*', cors());
 app.use(passport.initialize());
 passport.use('jwt', jwtStrategy);
 
+// simple backend test route for React Native
+app.get("/test", (req, res) => {
+  res.json({ message: "Backend Working!" });
+});
 // limit repeated failed requests to auth endpoints
 if (config.env === 'production') {
   app.use('/v1/auth', authLimiter);

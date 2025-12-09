@@ -1,74 +1,66 @@
-# app/api/v1/mrv.py
-
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status
 from bson import ObjectId
+import random
+import hashlib
 from datetime import datetime
-from typing import Optional
 
 from app.db.mongo import get_db
-from app.schemas.mrv_schema import MRVCreate, MRVOut
-from app.services.mrv_service import build_mrv_record, compute_mrv_hash
-from app.services.project_service import get_project
+from app.services.project_service import get_project, update_project
 from app.api.deps import get_current_user
 
 router = APIRouter()
 COLL = "mrv_records"
 
 
-@router.post("/mrv", response_model=MRVOut, status_code=201)
-async def create_mrv(payload: MRVCreate, current_user=Depends(get_current_user)):
+@router.post("/mrv/dummy", summary="Generate dummy MRV report automatically")
+async def create_dummy_mrv(project_id: str, current_user=Depends(get_current_user)):
     db = get_db()
 
-    # normalize ML dict for service; Pydantic model_dump(by_alias=True) ensures Tile_ID alias handled
-    ml_dict = payload.ml_result.model_dump(by_alias=True)
+    # verify project exists
+    project = await get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
 
-    record = build_mrv_record(
-        upload_id=payload.upload_id,
-        ml_result=ml_dict,
-        sat_result={
-            "ndvi_satellite": payload.ndvi_satellite,
-            "satellite_score": payload.satellite_score,
-        }
-    )
+    # ----- Dummy ML Result -----
+    dummy_ml = {
+        "Tile_ID": f"TILE-{random.randint(1000,9999)}",
+        "canopy_cover": round(random.uniform(40, 95), 2),
+        "biomass_estimate": round(random.uniform(4.5, 18.5), 2),
+        "tree_health_index": round(random.uniform(0.60, 0.98), 2),
+    }
 
-    # attach project_id from payload
-    record["project_id"] = payload.project_id
+    # ----- Dummy Satellite Data -----
+    ndvi = round(random.uniform(0.35, 0.90), 3)
+    sat_score = round(random.uniform(60, 98), 1)
 
-    # fetch project plantation_hash if available
-    plantation_hash: Optional[str] = None
-    if payload.project_id:
-        proj = await get_project(payload.project_id)
-        if proj and isinstance(proj.get("plantation"), dict):
-            # expecting plantation.plantation_hash saved on project
-            plantation_hash = proj.get("plantation", {}).get("plantation_hash") or proj.get("plantation", {}).get("hash")
+    # ----- Record -----
+    record = {
+        "project_id": project_id,
+        "upload_id": f"dummy-UP-{random.randint(1000,9999)}",
+        "ml_result": dummy_ml,
+        "sat_result": {
+            "ndvi_satellite": ndvi,
+            "satellite_score": sat_score,
+        },
+        "created_at": datetime.utcnow(),
+    }
 
-    # compute mrv_hash and persist it in record
-    try:
-        record["mrv_hash"] = compute_mrv_hash(record, plantation_hash=plantation_hash)
-    except Exception:
-        # don't block creation if hashing somehow fails; set None
-        record["mrv_hash"] = None
+    # Create deterministic hash
+    hash_input = f"{project_id}-{ndvi}-{sat_score}-{record['ml_result']}"
+    record["mrv_hash"] = hashlib.sha256(hash_input.encode()).hexdigest()
 
-    # insert into MongoDB
+    # Insert MRV record
     res = await db[COLL].insert_one(record)
-    saved = await db[COLL].find_one({"_id": res.inserted_id})
-    if not saved:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create MRV record")
+    record["id"] = str(res.inserted_id)
 
-    saved["id"] = str(saved["_id"])
-    # Ensure created_at is a datetime for Pydantic MRVOut
-    return saved
+    # Attach MRV reference to project
+    existing = project.get("mrv_ids") or []
+    existing.append(record["id"])
 
+    await update_project(project_id, {"mrv_ids": existing})
 
-@router.get("/mrv/{mrv_id}", response_model=MRVOut)
-async def get_mrv(mrv_id: str, current_user=Depends(get_current_user)):
-    db = get_db()
-    try:
-        obj = ObjectId(mrv_id)
-    except Exception:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid MRV id")
-    rec = await db[COLL].find_one({"_id": obj})
-    if not rec:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    rec["id"] = str(rec["_id"])
-    return rec
+    return {
+        "success": True,
+        "message": "Dummy MRV generated",
+        "mrv_record": record
+    }

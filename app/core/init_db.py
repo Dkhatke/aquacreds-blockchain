@@ -1,4 +1,5 @@
-﻿import asyncio
+﻿#  app/core/init_db.py
+import asyncio
 from app.db.mongo import get_db
 from app.models.collections import USERS_COLL, PROJECTS_COLL, UPLOADS_COLL, MRV_COLL
 from pymongo import ASCENDING, GEOSPHERE

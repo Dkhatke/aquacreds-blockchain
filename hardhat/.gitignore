@@ -15,3 +15,86 @@ node_modules
 
 # Hardhat Ignition default folder for deployments against a local node
 ignition/deployments/chain-31337
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# ========================
+# Environment variables / Secrets
+# ========================
+.env
+.env.*
+*.env
+
+# ========================
+# IDE / Editor
+# ========================
+.vscode/
+.idea/
+*.iml
+
+# ========================
+# OS generated files
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# Logs
+# ========================
+*.log
+logs/
+
+# ========================
+# Test & coverage
+# ========================
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+
+# ========================
+# FastAPI / Uvicorn
+# ========================
+uvicorn.log
+
+# ========================
+# Mongo / Database dumps
+# ========================
+*.bson
+*.json.backup
+
+# ========================
+# Uploads / Generated files
+# ========================
+uploads/
+media/
+tmp/
+
+# ========================
+# ML / Data (if any)
+# ========================
+*.h5
+*.pkl
+*.joblib
+*.pt
+*.onnx
+models/
+data/
+
+# ========================
+# Husky / Git hooks build artifacts
+# ========================
+.husky/_/
+

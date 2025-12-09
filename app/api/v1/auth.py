@@ -46,6 +46,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     user["id"] = str(user["_id"])
     return user
 
+@router.get("/users")
+async def list_users():
+    db = get_db()
+    cursor = db["users"].find({})
+    users = []
+    async for u in cursor:
+        u["id"] = str(u["_id"])
+        users.append(u)
+    return users
+
 @router.get("/auth/me", response_model=UserOut)
 async def me(current_user=Depends(get_current_user)):
     return UserOut(

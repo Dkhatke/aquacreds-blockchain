@@ -1,8 +1,9 @@
-# app/api/v1/mrv.py
 from fastapi import APIRouter, Depends, HTTPException, status
 from bson import ObjectId, errors as bson_errors
 from typing import Optional, List
 from datetime import datetime
+import hashlib
+import json
 
 from app.db.mongo import get_db
 from app.schemas.mrv_schema import MRVCreate, MRVOut
@@ -12,7 +13,6 @@ from app.api.deps import get_current_user
 router = APIRouter()
 COLL = "mrv_records"
 
-
 @router.post("/mrv", response_model=MRVOut, status_code=201)
 async def create_mrv(payload: MRVCreate, current_user=Depends(get_current_user)):
     """
@@ -20,7 +20,7 @@ async def create_mrv(payload: MRVCreate, current_user=Depends(get_current_user))
     """
     db = get_db()
 
-    ml_dict = payload.ml_result.model_dump(by_alias=True)
+    ml_dict = payload.ml_result.model_dump(by_alias=True) if hasattr(payload.ml_result, "model_dump") else payload.ml_result
     record = build_mrv_record(
         upload_id=payload.upload_id,
         ml_result=ml_dict,
@@ -38,7 +38,7 @@ async def create_mrv(payload: MRVCreate, current_user=Depends(get_current_user))
         try:
             proj = await db["projects"].find_one({"_id": ObjectId(payload.project_id)})
             if proj and isinstance(proj.get("plantation"), dict):
-                plantation_hash = proj.get("plantation", {}).get("plantation_hash") or proj.get("plantation", {}).get("hash")
+                plantation_hash = proj.get("plantation", {}).get("plantation_hash") or proj.get("plantation", {}).get("hash") or proj.get("plantation_hash")
         except Exception:
             plantation_hash = None
 
@@ -46,7 +46,12 @@ async def create_mrv(payload: MRVCreate, current_user=Depends(get_current_user))
     try:
         record["mrv_hash"] = compute_mrv_hash(record, plantation_hash=plantation_hash)
     except Exception:
-        record["mrv_hash"] = None
+        # fallback to custom sha256 of record
+        try:
+            rjson = json.dumps(record, sort_keys=True, default=str).encode("utf-8")
+            record["mrv_hash"] = hashlib.sha256(rjson).hexdigest()
+        except Exception:
+            record["mrv_hash"] = None
 
     # Insert
     res = await db[COLL].insert_one(record)
@@ -83,35 +88,6 @@ async def get_mrv(mrv_id: str, current_user=Depends(get_current_user)):
     # 3) fallback search by id field / mrv_hash / upload_id
     if not doc:
         doc = await db[COLL].find_one({"$or": [{"id": mrv_id}, {"mrv_hash": mrv_id}, {"upload_id": mrv_id}]})
-
-    if not doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="mrv not found")
-
-    doc["id"] = str(doc["_id"])
-    return doc
-
-
-@router.get("/mrv/{mrv_id}", response_model=MRVOut)
-async def get_mrv(mrv_id: str, current_user=Depends(get_current_user)):
-    db = get_db()
-    doc = None
-
-    # 1) try as ObjectId
-    try:
-        obj = ObjectId(mrv_id)
-    except (bson_errors.InvalidId, Exception):
-        obj = None
-
-    if obj is not None:
-        doc = await db["mrv_records"].find_one({"_id": obj})
-
-    # 2) try direct string _id (some code may have stored string _id)
-    if not doc:
-        doc = await db["mrv_records"].find_one({"_id": mrv_id})
-
-    # 3) fallback: maybe stored an 'id' field, mrv_hash, or upload_id
-    if not doc:
-        doc = await db["mrv_records"].find_one({"$or": [{"id": mrv_id}, {"mrv_hash": mrv_id}, {"upload_id": mrv_id}]})
 
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="mrv not found")

@@ -1,7 +1,11 @@
 # app/api/v1/projects.py
 import hashlib
 import json
-from fastapi import APIRouter, Depends, HTTPException, status, Body, Request, File, UploadFile, Form, Query
+import os
+from fastapi import (
+    APIRouter, Depends, HTTPException, status, Body,
+    Request, File, UploadFile, Form, Query
+)
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date
 from bson import ObjectId
@@ -9,630 +13,699 @@ from bson import ObjectId
 from app.db.mongo import get_db
 from app.schemas.project_schema import ProjectCreate, ProjectOut
 from app.services.project_service import (
-    create_project,
-    get_project,
-    list_projects,
-    update_project,
-    add_photo_to_project,
+    create_project, get_project, list_projects, update_project, add_photo_to_project
 )
 from app.services.upload_service import get_upload_by_upload_id
 from app.api.deps import get_current_user
+# add imports at top of file if not present
+import os
+from web3 import Web3
+from fastapi import BackgroundTasks
+
+from blockchain.contract_loader import load_contract
+from blockchain.transaction_service import TxService
+from app.services.blockchain_tx_service import save_tx  # ensure exists
+from app.db.mongo import get_db
+
+ADMIN_PRIVATE_KEY = os.getenv("ADMIN_PRIVATE_KEY")
+ADMIN_ADDRESS = os.getenv("ADMIN_ADDRESS")  # store checksum later
+
+def _checksum(addr: str) -> str | None:
+    try:
+        return Web3.to_checksum_address(addr)
+    except Exception:
+        return None
+
+def calculate_credits(mrv, plantation):
+    try:
+        area = float(plantation.get("area_restored_hectares", 1)) or 1
+    except:
+        area = 1
+
+    # 1 — Dummy MRV carbon stock
+    if mrv.get("carbon_stock_tCO2e"):
+        return max(1, round(float(mrv["carbon_stock_tCO2e"]) * area))
+
+    # 2 — ML MRV carbon stock
+    ml = mrv.get("ml_result", {})
+    biomass = ml.get("biomass", {})
+    if biomass.get("CO2eq_t_per_ha"):
+        return max(1, round(float(biomass["CO2eq_t_per_ha"]) * area))
+
+    # 3 — Last fallback: saplings
+    saplings = plantation.get("number_of_saplings", 0)
+    return max(1, round(int(saplings) / 10))
 
 router = APIRouter()
 
+# -------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------
+def _safe_id(v): return str(v) if isinstance(v, ObjectId) else v
 
-# ---------------------------
-# Utility helpers
-# ---------------------------
-
-def _is_objectid(v: Any) -> bool:
-    return isinstance(v, ObjectId)
-
-
-def _to_str_safe(v: Any) -> Any:
-    if _is_objectid(v):
-        return str(v)
+def _clean_ts(v):
     if isinstance(v, (datetime, date)):
         return v.isoformat()
     return v
 
-
-def _recursive_convert(obj: Any) -> Any:
+def _clean(obj):
+    """ Recursively convert ObjectId → str, datetime → iso, remove bytes """
     if isinstance(obj, dict):
         new = {}
         for k, v in obj.items():
-            # drop raw bytes fields (safety)
             if isinstance(v, (bytes, bytearray)):
                 continue
-            new[k] = _recursive_convert(v)
+            new[k] = _clean(v)
         return new
-
     if isinstance(obj, list):
-        return [_recursive_convert(x) for x in obj]
+        return [_clean(x) for x in obj]
+    return _clean_ts(_safe_id(obj))
 
-    return _to_str_safe(obj)
 
-
-# ---------------------------
-# Cleaners: produce JSON-safe docs
-# ---------------------------
-
-def _clean_project_doc(raw: Dict[str, Any]) -> Dict[str, Any]:
+# -------------------------------------------------------------
+# STEP 1 — CREATE PROJECT DRAFT
+# -------------------------------------------------------------
+@router.post("/projects/create-step1")
+async def create_step1(payload: dict = Body(...), current_user=Depends(get_current_user)):
     """
-    Normalize and sanitize a raw project document from MongoDB so it matches ProjectOut
-    and is safe for JSON encoding.
-    Guarantees presence of required fields for ProjectOut.
+    Accepts only basic organization + contact + address (NO plantation)
     """
-    if not isinstance(raw, dict):
-        return {}
-
-    p = dict(raw)  # shallow copy
-
-    # _id -> id (string)
-    if p.get("_id") is not None:
-        p["id"] = str(p["_id"])
-    else:
-        p.setdefault("id", str(ObjectId()))
-
-    # OWNER: ensure dict and string owner_id
-    owner = p.get("owner") or {}
-    if isinstance(owner, dict) and owner.get("owner_id") is not None:
-        owner["owner_id"] = str(owner["owner_id"])
-    p["owner"] = owner
-
-    # ORGANIZATION: ensure exists
-    organization = p.get("organization")
-    if not isinstance(organization, dict):
-        organization = {
-            "name": owner.get("owner_org") or "Unknown Organization",
-            "reg_no": None,
-            "year_established": None,
-        }
-    p["organization"] = organization
-
-    # ORGANIZATION_ID: ensure ALWAYS present and deterministic when missing
-    org_id = p.get("organization_id")
-    if not org_id:
-        # if organization name exists, derive a deterministic 24-char hex string from its hash
-        name = (organization.get("name") or "").strip()
-        if name:
-            h = hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
-            org_id = h
-        else:
-            org_id = str(ObjectId())
-    p["organization_id"] = str(org_id)
-
-    # CONTACT PERSON: default fallback
-    contact = p.get("contact_person")
-    if not isinstance(contact, dict):
-        contact = {
-            "full_name": owner.get("owner_name") or "Contact Person",
-            "email": owner.get("owner_email") or "no-reply@example.com",
-            "mobile_no": "000000",
-            "designation": None,
-        }
-    p["contact_person"] = contact
-
-    # ADDRESS fallback
-    address = p.get("address")
-    if not isinstance(address, dict):
-        address = {"state": "NA", "district": "NA", "full_address": "Not provided", "pincode": "000"}
-    p["address"] = address
-
-    # PLANTATION: ensure structure + iso date
-    plantation = p.get("plantation")
-    if not isinstance(plantation, dict):
-        plantation = {
-            "project_title": p.get("name") or "Untitled Project",
-            "plantation_date": _to_str_safe(p.get("created_at") or datetime.utcnow()),
-            "location": p["address"],
-            "area_restored_hectares": p.get("area_restored_hectares", 0.0),
-            "species": p.get("species", []),
-            "number_of_saplings": p.get("number_of_saplings"),
-            "seed_source": None,
-        }
-    else:
-        pd = plantation.get("plantation_date")
-        if pd is not None:
-            if isinstance(pd, (datetime, date)):
-                plantation["plantation_date"] = pd.isoformat()
-            else:
-                plantation["plantation_date"] = str(pd)
-        # ensure location exists
-        loc = plantation.get("location")
-        if not isinstance(loc, dict):
-            plantation["location"] = p.get("address") or {}
-    p["plantation"] = plantation
-
-    # STATUS & LISTED
-    p["status"] = p.get("status", "draft")
-    p["listed"] = bool(p.get("listed", False))
-
-    # GEOTAG PHOTOS & VERIFIER HISTORY (clean recursively)
-    p["geotag_photos"] = _recursive_convert(p.get("geotag_photos") or [])
-    p["verifier_history"] = _recursive_convert(p.get("verifier_history") or [])
-
-    # ensure mrv_ids is a list of strings
-    mrv_ids = p.get("mrv_ids") or []
-    if isinstance(mrv_ids, list):
-        p["mrv_ids"] = [str(x) for x in mrv_ids if x is not None]
-    else:
-        p["mrv_ids"] = [str(mrv_ids)]
-
-    # issuance_history safe
-    p["issuance_history"] = _recursive_convert(p.get("issuance_history") or [])
-
-    # sanitize top-level timestamps
-    for t in ("created_at", "updated_at", "verified_at"):
-        if t in p and p[t] is not None:
-            if isinstance(p[t], (datetime, date)):
-                p[t] = p[t].isoformat()
-            else:
-                p[t] = str(p[t])
-
-    # drop binary payloads accidentally included
-    for banned in ("file_bytes", "raw", "blob", "data"):
-        if banned in p:
-            p.pop(banned, None)
-
-    # final recursive conversion (ObjectId -> str etc.)
-    return _recursive_convert(p)
-
-
-def _clean_mrv_doc(raw: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(raw, dict):
-        return {}
-    m = dict(raw)
-    if m.get("_id") is not None:
-        m["id"] = str(m["_id"])
-    # created_at normalization
-    if m.get("created_at") is not None:
-        if isinstance(m["created_at"], (datetime, date)):
-            m["created_at"] = m["created_at"].isoformat()
-        else:
-            m["created_at"] = str(m["created_at"])
-    # ml_result nested clean
-    m["ml_result"] = _recursive_convert(m.get("ml_result") or {})
-    # ensure carbon number is simple float if possible
-    if "carbon_stock_tCO2e" in m:
-        try:
-            m["carbon_stock_tCO2e"] = float(m["carbon_stock_tCO2e"])
-        except Exception:
-            pass
-    # drop binary if present
-    for banned in ("file_bytes", "raw", "blob", "data"):
-        if banned in m:
-            m.pop(banned, None)
-    return _recursive_convert(m)
-
-
-# ---------------------------
-# RESPONSE BUILDER
-# ---------------------------
-
-def _build_project_response_shape(raw: Dict[str, Any]) -> Dict[str, Any]:
-    return _clean_project_doc(raw)
-
-
-# ---------------------------
-# ENDPOINTS
-# ---------------------------
-
-@router.post("/projects", response_model=ProjectOut, status_code=201)
-async def create_project_endpoint(payload: ProjectCreate, current_user=Depends(get_current_user)):
-    if current_user.get("role") != "user":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only users can create projects")
-
     db = get_db()
 
-    # ---------------------------
-    # 1. Create the normal project as before
-    # ---------------------------
-    proj_doc = payload.model_dump()
-    proj_doc["owner"] = {
-        "owner_id": str(current_user["id"]),
-        "owner_name": current_user.get("full_name"),
-        "owner_email": current_user.get("email"),
-        "owner_org": current_user.get("organization"),
+    doc = {
+        "organization": payload.get("organization"),
+        "contact_person": payload.get("contact_person"),
+        "address": payload.get("address"),
+        "owner": {
+            "owner_id": str(current_user["id"]),
+            "owner_name": current_user.get("full_name"),
+            "owner_email": current_user.get("email"),
+        },
+        "status": "draft",
+        "listed": False,
+        "mrv_ids": [],
+        "created_at": datetime.utcnow(),
     }
-    proj_doc.setdefault("status", "draft")
-    proj_doc.setdefault("listed", False)
-    proj_doc.setdefault("mrv_ids", [])
 
-    new_proj = await create_project(proj_doc)
-    if not new_proj:
-        raise HTTPException(status_code=500, detail="Failed to create project")
-
-    project_id = str(new_proj["_id"])
-
-    # ---------------------------
-    # 2. Create NGO wallet if missing
-    # ---------------------------
-    # Find user by email (safer cross-runtime)
-    user = await db["users"].find_one({"email": current_user.get("email")})
-
-    # Wallet creation/import is done via blockchain.wallet_manager
-    try:
-        from blockchain.wallet_manager import WalletManager
-    except Exception:
-        WalletManager = None
-
-    if user is None:
-        # shouldn't happen — guard
-        ngo_wallet = None
-        ngo_private = None
-    else:
-        if "wallet_address" not in user or not user.get("wallet_address"):
-            if WalletManager is not None:
-                wallet = WalletManager.create_wallet()
-                await db["users"].update_one(
-                    {"_id": user["_id"]},
-                    {"$set": {
-                        "wallet_address": wallet["address"],
-                        "wallet_private_key": wallet["private_key"]
-                    }}
-                )
-                ngo_wallet = wallet["address"]
-                ngo_private = wallet["private_key"]
-            else:
-                ngo_wallet = None
-                ngo_private = None
-        else:
-            ngo_wallet = user.get("wallet_address")
-            ngo_private = user.get("wallet_private_key")
-
-    # ---------------------------
-    # 3. Create SHA256 plantation hash
-    # ---------------------------
-    plantation_json = json.dumps(proj_doc, default=str)
-    plantation_hash = hashlib.sha256(plantation_json.encode()).hexdigest()
-
-    # ---------------------------
-    # 4. Register project on blockchain (best-effort; failures do not block creation)
-    # ---------------------------
-    try:
-        from blockchain.contract_loader import load_contract
-        from blockchain.transaction_service import TxService
-
-        if ngo_private and ngo_wallet:
-            registry = load_contract("ProjectRegistry")
-            receipt = TxService.send_user_tx(
-                registry.functions.registerProject(project_id, plantation_hash),
-                ngo_private,
-                ngo_wallet
-            )
-            tx_hash = receipt.transactionHash.hex()
-            # Store blockchain tx in DB
-            await db["projects"].update_one(
-                {"_id": new_proj["_id"]},
-                {"$set": {
-                    "plantation_hash": plantation_hash,
-                    "blockchain_tx": tx_hash
-                }}
-            )
-        else:
-            # Save plantation_hash at least in DB so we keep local proof
-            await db["projects"].update_one(
-                {"_id": new_proj["_id"]},
-                {"$set": {
-                    "plantation_hash": plantation_hash
-                }}
-            )
-    except Exception as e:
-        # Log but don't raise — keep the project creation resilient.
-        print("Blockchain registration failed:", e)
-        # still attempt to save plantation_hash locally
-        try:
-            await db["projects"].update_one(
-                {"_id": new_proj["_id"]},
-                {"$set": {
-                    "plantation_hash": plantation_hash
-                }}
-            )
-        except Exception:
-            pass
-
-    # ---------------------------
-    # OPTIONAL: Attach dummy MRV (existing logic)
-    # ---------------------------
-    try:
-        dummy = await db["mrv_records"].find_one({"is_dummy": True})
-        if dummy:
-            dummy_id_str = str(dummy["_id"])
-            await db["projects"].update_one(
-                {"_id": new_proj["_id"]},
-                {"$addToSet": {"mrv_ids": dummy_id_str}}
-            )
-            new_proj = await db["projects"].find_one({"_id": new_proj["_id"]})
-    except Exception:
-        pass
-
-    return _build_project_response_shape(new_proj)
+    res = await db["projects"].insert_one(doc)
+    return {"success": True, "id": str(res.inserted_id)}
 
 
+# -------------------------------------------------------------
+# STEP 2 — ADD PLANTATION DETAILS
+# -------------------------------------------------------------
+@router.put("/projects/{project_id}/step2-plantation")
+async def update_step2(project_id: str, payload: dict = Body(...), current_user=Depends(get_current_user)):
+    db = get_db()
+    proj = await get_project(project_id)
+
+    if not proj:
+        raise HTTPException(404, "Project not found")
+
+    if str(proj["owner"]["owner_id"]) != str(current_user["id"]):
+        raise HTTPException(403, "Not allowed")
+
+    updates = {
+        "plantation": payload.get("plantation"),
+        "updated_at": datetime.utcnow(),
+    }
+
+    updated = await update_project(project_id, updates)
+    return _clean(updated)
+
+
+# -------------------------------------------------------------
+# STEP 3 — FINAL SUBMISSION
+# -------------------------------------------------------------
+@router.put("/projects/{project_id}/submit")
+async def submit_project(project_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+
+    proj = await db["projects"].find_one({"_id": ObjectId(project_id)})
+    if not proj:
+        raise HTTPException(404, "Project not found")
+
+    # Only owner can submit
+    if str(proj["owner"]["owner_id"]) != str(current_user["id"]):
+        raise HTTPException(403, "Not allowed")
+
+    # 🔵 AUTO GENERATE MRV IF NONE EXISTS
+    existing_mrvs = proj.get("mrv_ids", [])
+    if not existing_mrvs:
+
+        dummy_mrv = {
+            "project_id": project_id,
+            "ndvi": round(random.uniform(0.45, 0.85), 3),
+            "ndwi": round(random.uniform(0.10, 0.45), 3),
+            "canopy_cover": random.randint(40, 90),
+            "biomass_ton": round(random.uniform(12, 60), 2),
+            "carbon_stock_tCO2e": round(random.uniform(20, 120), 2),
+            "timestamp": datetime.utcnow().isoformat(),
+            "status": "verified"
+        }
+
+        # Generate MRV hash
+        mrv_hash = hashlib.sha256(str(dummy_mrv).encode()).hexdigest()
+        dummy_mrv["mrv_hash"] = mrv_hash
+
+        # Save MRV
+        saved = await db["mrv_records"].insert_one(dummy_mrv)
+        mrv_id = str(saved.inserted_id)
+
+        # Attach to project
+        await db["projects"].update_one(
+            {"_id": ObjectId(project_id)},
+            {"$addToSet": {"mrv_ids": mrv_id}}
+        )
+
+    # 🔵 Update project status → submitted
+    await db["projects"].update_one(
+        {"_id": ObjectId(project_id)},
+        {"$set": {"status": "submitted"}}
+    )
+
+    return {"success": True, "message": "Project submitted successfully"}
+
+# -------------------------------------------------------------
+# GET PROJECT BY ID
+# -------------------------------------------------------------
 @router.get("/projects/{project_id}", response_model=ProjectOut)
 async def get_project_endpoint(project_id: str, current_user=Depends(get_current_user)):
     proj = await get_project(project_id)
     if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return _build_project_response_shape(proj)
+        raise HTTPException(404, "Project not found")
+    return _clean(proj)
 
 
-@router.get("/projects", response_model=List[ProjectOut])
-async def list_projects_endpoint(
-    projectid: str | None = Query(None),
-    status: Optional[str] = None,
+# -------------------------------------------------------------
+# USER LIST OWN PROJECTS
+# -------------------------------------------------------------
+@router.get("/projects")
+async def list_user_projects(
     owner_id: Optional[str] = None,
-    limit: int = 50,
-    skip: int = 0,
-):
-    q: Dict[str, Any] = {}
-
-    if projectid:
-        try:
-            q = {"_id": ObjectId(projectid)}
-        except Exception:
-            q = {"id": projectid}
-    else:
-        if status:
-            q["status"] = status
-        if owner_id:
-            q["owner.owner_id"] = owner_id
-
-    projects = await list_projects(q, limit=limit, skip=skip)
-    return [_build_project_response_shape(p) for p in projects]
-
-
-@router.get("/projects/actions/submitted-with-mrv")
-async def list_submitted_projects_with_mrvs(
-    status: str | None = "submitted",
-    limit: int = 100,
-    skip: int = 0,
     current_user=Depends(get_current_user),
 ):
-    """
-    Verifier/admin-only endpoint returning projects with the given status
-    and embedding full MRV documents (mrv_records) for each project's mrv_ids.
-    """
-    role = current_user.get("role")
-    if role not in ("verifier", "admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only verifiers/admins allowed")
+    db = get_db()
+    q = {}
+
+    if owner_id:
+        q["owner.owner_id"] = owner_id
+
+    cursor = db["projects"].find(q).sort("created_at", -1)
+
+    out = []
+    async for p in cursor:
+        p["id"] = str(p["_id"])
+        out.append(_clean(p))
+
+    return out
+
+
+# -------------------------------------------------------------
+# ADMIN & VERIFIER: LIST PROJECTS
+# -------------------------------------------------------------
+@router.get("/projects/admin-list")
+async def admin_list(
+    status: Optional[str] = None,
+    current_user=Depends(get_current_user)
+):
+    if current_user["role"] not in ("admin", "verifier"):
+        raise HTTPException(403, "Not allowed")
 
     db = get_db()
-    q = {"status": status} if status else {}
-    cursor = db["projects"].find(q).skip(skip).limit(limit)
+    q = {}
+    if status:
+        q["status"] = status
 
-    projects_raw = []
-    all_mrv_hexes = []
+    cursor = db["projects"].find(q)
 
+    out = []
     async for p in cursor:
-        # ensure id string
-        p["id"] = str(p.get("_id") or p.get("id") or ObjectId())
-        raw = p.get("mrv_ids") or []
-        if isinstance(raw, list):
-            hexes = [str(x) for x in raw if x]
-        else:
-            hexes = [str(raw)]
-        p["_mrv_hexes"] = hexes
-        all_mrv_hexes.extend([h for h in hexes if h])
-        projects_raw.append(p)
+        p["id"] = str(p["_id"])
+        out.append(_clean(p))
 
-    # Batch fetch MRV docs
-    mrv_map: Dict[str, Dict[str, Any]] = {}
-    if all_mrv_hexes:
-        obj_ids = []
-        string_ids = []
-        for h in set(all_mrv_hexes):
-            try:
-                obj_ids.append(ObjectId(h))
-            except Exception:
-                string_ids.append(h)
-
-        queries = []
-        if obj_ids:
-            queries.append({"_id": {"$in": obj_ids}})
-        if string_ids:
-            queries.append({"$or": [{"_id": {"$in": string_ids}}, {"id": {"$in": string_ids}}, {"mrv_hash": {"$in": string_ids}}, {"upload_id": {"$in": string_ids}}]})
-
-        if queries:
-            q_final = {"$or": queries} if len(queries) > 1 else queries[0]
-            async for m in db["mrv_records"].find(q_final):
-                key = str(m.get("_id"))
-                mrv_map[key] = _clean_mrv_doc(m)
-                if m.get("mrv_hash"):
-                    mrv_map[str(m["mrv_hash"])] = _clean_mrv_doc(m)
-                if m.get("upload_id"):
-                    mrv_map[str(m["upload_id"])] = _clean_mrv_doc(m)
-
-    # Attach MRV docs to each project and clean project
-    final_projects: List[Dict[str, Any]] = []
-    for p in projects_raw:
-        hexes = p.pop("_mrv_hexes", [])
-        p["mrv_details"] = [mrv_map.get(h) for h in hexes if mrv_map.get(h)]
-        p_clean = _clean_project_doc(p)
-        final_projects.append(p_clean)
-
-    return {"count": len(final_projects), "projects": final_projects}
+    return {"success": True, "projects": out}
 
 
-@router.put("/projects/{project_id}", response_model=ProjectOut)
-async def update_project_endpoint(project_id: str, updates: dict = Body(...), current_user=Depends(get_current_user)):
-    proj = await get_project(project_id)
-    if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    if current_user["role"] != "admin" and str(proj["owner"]["owner_id"]) != str(current_user["id"]):
-        raise HTTPException(status_code=403, detail="Not allowed")
-
-    updated = await update_project(project_id, updates)
-    if not updated:
-        raise HTTPException(status_code=500, detail="Update failed")
-
-    return _build_project_response_shape(updated)
-
-
-@router.post("/projects/{project_id}/add-photo", response_model=ProjectOut)
-async def add_photo_endpoint(
+# -------------------------------------------------------------
+# ADD PHOTO (GEOTAG)
+# -------------------------------------------------------------
+@router.post("/projects/{project_id}/add-photo")
+async def add_photo(
     project_id: str,
     request: Request,
-    file: UploadFile | None = File(None),
-    latitude: float | None = Form(None),
-    longitude: float | None = Form(None),
-    timestamp: str | None = Form(None),
-    filename: str | None = Form(None),
+    file: UploadFile = File(...),
+    latitude: float = Form(...),
+    longitude: float = Form(...),
+    timestamp: str = Form(...),
     current_user=Depends(get_current_user),
 ):
     proj = await get_project(project_id)
     if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(404, "Project not found")
 
-    if current_user["role"] != "admin" and str(proj["owner"]["owner_id"]) != str(current_user["id"]):
-        raise HTTPException(status_code=403, detail="Not allowed")
+    if str(proj["owner"]["owner_id"]) != str(current_user["id"]):
+        raise HTTPException(403, "Not allowed")
 
-    content_type = request.headers.get("content-type", "")
-    is_json = "application/json" in content_type.lower()
+    file_bytes = await file.read()
 
-    upload_doc: Optional[Dict[str, Any]] = None
+    upload_doc = {
+        "file_bytes": file_bytes,
+        "filename": file.filename,
+        "latitude": latitude,
+        "longitude": longitude,
+        "timestamp": timestamp,
+    }
 
-    if is_json:
-        payload = await request.json()
-        upload_id = payload.get("upload_id")
-        if not upload_id:
-            raise HTTPException(status_code=400, detail="upload_id is required")
-        upload_doc = await get_upload_by_upload_id(upload_id)
-        if not upload_doc:
-            raise HTTPException(status_code=404, detail="Upload not found")
-    else:
-        if file is None:
-            form = await request.form()
-            file = form.get("file")
-            latitude = latitude or form.get("latitude")
-            longitude = longitude or form.get("longitude")
-            timestamp = timestamp or form.get("timestamp")
-            filename = filename or form.get("filename")
-
-        if file is None:
-            raise HTTPException(status_code=400, detail="file is required")
-
-        try:
-            file_bytes = await file.read()
-        except Exception:
-            raise HTTPException(status_code=400, detail="Failed to read uploaded file")
-
-        upload_doc = {
-            "file_bytes": file_bytes,
-            "filename": filename or file.filename,
-            "original_filename": file.filename,
-            "latitude": float(latitude),
-            "longitude": float(longitude),
-            "timestamp": timestamp,
-            "size_bytes": len(file_bytes),
-        }
-
-    updated_proj = await add_photo_to_project(project_id, upload_doc, current_user)
-    if not updated_proj:
-        raise HTTPException(status_code=500, detail="Failed to attach photo")
-
-    return _build_project_response_shape(updated_proj)
+    updated = await add_photo_to_project(project_id, upload_doc, current_user)
+    return _clean(updated)
 
 
-@router.post("/projects/{project_id}/verify", response_model=ProjectOut)
-async def verify_project_endpoint(
-    project_id: str,
-    payload: dict = Body(...),
-    current_user=Depends(get_current_user),
-):
-    action = (payload.get("action") or "").lower()
-    notes = payload.get("notes") or ""
+# -------------------------------------------------------------
+# GENERATE MRV (dummy)
+# -------------------------------------------------------------
+import random
+def sha256(obj): return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
-    if action not in ("approve", "reject"):
-        raise HTTPException(status_code=400, detail="action must be approve or reject")
+@router.post("/projects/{project_id}/generate-mrv")
+async def generate_mrv(project_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+
+    if current_user["role"] not in ("user", "verifier", "admin"):
+        raise HTTPException(403, "Not allowed")
+
+    proj = await get_project(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+
+    # dummy metrics
+    metrics = {
+        "ndvi": round(random.uniform(0.3, 0.9), 3),
+        "ndwi": round(random.uniform(0.1, 0.7), 3),
+        "canopy_cover": random.randint(40, 95),
+        "biomass_ton": round(random.uniform(5, 60), 2),
+        "carbon_stock_tCO2e": round(random.uniform(10, 120), 2),
+    }
+
+    mrv_record = {
+        "project_id": project_id,
+        "metrics": metrics,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+    mrv_hash = sha256(mrv_record)
+    mrv_record["mrv_hash"] = mrv_hash
+
+    res = await db["mrv_records"].insert_one(mrv_record)
+    mrv_id = str(res.inserted_id)
+
+    await db["projects"].update_one(
+        {"_id": ObjectId(project_id)},
+        {"$addToSet": {"mrv_ids": mrv_id}}
+    )
+
+    return {"success": True, "mrv_id": mrv_id, "mrv_hash": mrv_hash, "metrics": metrics}
+
+
+# -------------------------------------------------------------
+# VERIFIER/Admin APPROVE/REJECT
+# -------------------------------------------------------------
+@router.post("/projects/{project_id}/verify")
+async def verify_project(project_id: str, payload: dict = Body(...), current_user=Depends(get_current_user)):
+    action = payload.get("action")
+    notes = payload.get("notes", "")
 
     if current_user["role"] not in ("verifier", "admin"):
-        raise HTTPException(status_code=403, detail="Not allowed")
+        raise HTTPException(403, "Not allowed")
 
     proj = await get_project(project_id)
     if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(404, "Project not found")
 
     new_status = "approved" if action == "approve" else "rejected"
 
     entry = {
         "verifier_id": str(current_user["id"]),
-        "verifier_name": current_user.get("full_name") or current_user.get("email"),
+        "verifier_name": current_user.get("full_name"),
         "action": action,
         "notes": notes,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
     history = proj.get("verifier_history") or []
     history.append(entry)
 
-    updates = {
+    updated = await update_project(project_id, {
         "status": new_status,
         "verifier_history": history,
         "updated_at": datetime.utcnow(),
-    }
+    })
 
-    updated = await update_project(project_id, updates)
-    if not updated:
-        raise HTTPException(status_code=500, detail="Failed to update")
-
-    return _build_project_response_shape(updated)
+    return _clean(updated)
 
 
-@router.post("/projects/{project_id}/issue", response_model=ProjectOut)
-async def issue_credits_endpoint(
-    project_id: str,
-    payload: dict = Body(...),  # {"action": "issue" | "reject", "notes": "optional"}
-    current_user=Depends(get_current_user),
-):
-    """
-    Admin-only: mark credits as issued or rejected for a project.
-    - action: "issue" -> status="issued", listed=True
-              "reject" -> status="rejected", listed=False
-    - notes: optional explanatory text
-    Adds an `issuance_history` entry (admin id/name/action/notes/timestamp).
-    Returns the updated project.
-    """
-    action = (payload.get("action") or "").strip().lower()
-    notes = payload.get("notes") or ""
+# -------------------------------------------------------------
+# ADMIN ISSUE CREDITS
+# -------------------------------------------------------------
+@router.post("/projects/{project_id}/issue")
+async def issue_credits(project_id: str, payload: dict = Body(...), current_user=Depends(get_current_user)):
 
-    if action not in ("issue", "reject"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="action must be 'issue' or 'reject'")
+    if current_user["role"] != "admin":
+        raise HTTPException(403, "Admins only")
 
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can issue credits")
+    action = payload.get("action")
+    notes = payload.get("notes", "")
 
     proj = await get_project(project_id)
     if not proj:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(404, "Not found")
 
     new_status = "issued" if action == "issue" else "rejected"
-    new_listed = True if action == "issue" else False
 
-    issuance_entry = {
-        "admin_id": str(current_user.get("id")),
-        "admin_name": current_user.get("full_name") or current_user.get("email"),
+    entry = {
+        "admin_id": str(current_user["id"]),
+        "admin_name": current_user.get("full_name"),
         "action": action,
         "notes": notes,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
-    existing = proj.get("issuance_history") or []
-    if not isinstance(existing, list):
-        existing = []
-    existing.append(issuance_entry)
+    history = proj.get("issuance_history") or []
+    history.append(entry)
 
-    updates = {
+    updated = await update_project(project_id, {
         "status": new_status,
-        "listed": new_listed,
-        "issuance_history": existing,
+        "issuance_history": history,
+        "listed": (action == "issue"),
         "updated_at": datetime.utcnow(),
+    })
+
+    return _clean(updated)
+
+@router.post("/projects/{project_id}/attach-upload", summary="Geotag upload disabled")
+async def user_attach_geotag(project_id: str, payload: dict = Body(...), current_user=Depends(get_current_user)):
+    """
+    Geotag uploads are disabled.
+    Frontend can still call this, but it will not save anything.
+    """
+    return {
+        "success": True,
+        "message": "Geotag skipped — upload not required",
+        "project_id": project_id
     }
 
-    updated = await update_project(project_id, updates)
-    if not updated:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update project")
+# blockchain
+@router.post("/projects/{project_id}/register")
+async def register_project_onchain(project_id: str, current_user=Depends(get_current_user)):
+    """
+    Compute plantation hash if missing and call registerProject(projectId, plantationHash).
+    Admin/private-key owner will send tx (ADMIN_PRIVATE_KEY).
+    """
+    db = get_db()
+    proj = await db["projects"].find_one({"_id": ObjectId(project_id)})
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
 
-    return _build_project_response_shape(updated)
+    # compute plantation hash deterministically (you can reuse your schema helper)
+    # e.g. use json.dumps on plantation fields
+    import json, hashlib
+    plantation = proj.get("plantation") or {}
+    plantation_json = json.dumps(plantation, sort_keys=True, default=str, separators=(",", ":"), ensure_ascii=False)
+    plantation_hash = hashlib.sha256(plantation_json.encode("utf-8")).hexdigest()
+
+    # if already registered, return existing tx
+    if proj.get("register_tx"):
+        return {"success": True, "message": "Already registered", "tx_hash": proj.get("register_tx")}
+
+    tx_hash = None
+    try:
+        contract = load_contract("ProjectRegistry")
+        admin_addr = _checksum(ADMIN_ADDRESS)
+        if not (ADMIN_PRIVATE_KEY and admin_addr):
+            raise Exception("Blockchain admin credentials not configured")
+
+        # synchronous send (TxService should return receipt)
+        receipt = TxService.send_user_tx(
+            contract.functions.registerProject(project_id, plantation_hash),
+            ADMIN_PRIVATE_KEY,
+            admin_addr
+        )
+        # if TxService returns web3 receipt object:
+        tx_hash = getattr(receipt, "transactionHash", None)
+        if tx_hash:
+            tx_hash = tx_hash.hex()
+        else:
+            # maybe it's dict
+            tx_hash = receipt.get("transactionHash").hex() if isinstance(receipt, dict) and receipt.get("transactionHash") else str(receipt)
+
+        await db["projects"].update_one({"_id": ObjectId(project_id)}, {"$set": {"plantation_hash": plantation_hash, "register_tx": tx_hash}})
+        await save_tx(project_id, "register_project", tx_hash)
+
+    except Exception as e:
+        # save failed log for retry; don't block caller
+        err_msg = str(e)
+        await db["blockchain_logs"].insert_one({
+            "project_id": project_id,
+            "operation": "register_project",
+            "status": "error",
+            "error": err_msg,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        return {"success": False, "detail": "Blockchain register failed", "error": err_msg}
+
+    return {"success": True, "plantation_hash": plantation_hash, "tx_hash": tx_hash}
+
+@router.post("/projects/{project_id}/submit-mrv")
+async def submit_mrv_onchain(project_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+    proj = await db["projects"].find_one({"_id": ObjectId(project_id)})
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # project should contain mrv_ids / mrv_hash - pick latest
+    mrv_ids = proj.get("mrv_ids", [])
+    if not mrv_ids:
+        raise HTTPException(status_code=400, detail="No MRV found for project")
+
+    latest_mrv_id = mrv_ids[-1] if isinstance(mrv_ids, list) else mrv_ids
+    # fetch MRV doc
+    mrv_doc = await db["mrv_records"].find_one({"_id": ObjectId(latest_mrv_id)}) if ObjectId.is_valid(latest_mrv_id) else await db["mrv_records"].find_one({"_id": latest_mrv_id})
+    if not mrv_doc:
+        raise HTTPException(status_code=404, detail="MRV not found")
+
+    mrv_hash = mrv_doc.get("mrv_hash")
+    if not mrv_hash:
+        raise HTTPException(status_code=400, detail="MRV missing hash")
+
+    # idempotency: if already submitted
+    if proj.get("mrv_submit_tx"):
+        return {"success": True, "message": "MRV already submitted", "tx_hash": proj.get("mrv_submit_tx")}
+
+    try:
+        contract = load_contract("ProjectRegistry")
+        admin_addr = _checksum(ADMIN_ADDRESS)
+        if not (ADMIN_PRIVATE_KEY and admin_addr):
+            raise Exception("Blockchain admin credentials not configured")
+
+        receipt = TxService.send_user_tx(
+            contract.functions.submitMRV(project_id, mrv_hash),
+            ADMIN_PRIVATE_KEY,
+            admin_addr
+        )
+        tx_hash = getattr(receipt, "transactionHash", None)
+        if tx_hash:
+            tx_hash = tx_hash.hex()
+        else:
+            tx_hash = receipt.get("transactionHash").hex() if isinstance(receipt, dict) and receipt.get("transactionHash") else str(receipt)
+
+        await db["projects"].update_one({"_id": ObjectId(project_id)}, {"$set": {"mrv_submit_tx": tx_hash, "mrv_status": "submitted"}})
+        await save_tx(project_id, "submit_mrv", tx_hash)
+
+    except Exception as e:
+        await db["blockchain_logs"].insert_one({
+            "project_id": project_id,
+            "operation": "submit_mrv",
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        return {"success": False, "detail": "Blockchain MRV submit failed", "error": str(e)}
+
+    return {"success": True, "tx_hash": tx_hash}
+
+
+# -----------------------------
+#   SUBMIT MRV TO BLOCKCHAIN
+# -----------------------------
+@router.post("/projects/{project_id}/submit-mrv")
+async def submit_mrv_onchain(project_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+
+    # Fetch project
+    proj = await db["projects"].find_one({"_id": ObjectId(project_id)})
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Expect MRV saved in project.mrv_details[]
+    mrv_list = proj.get("mrv_details", [])
+    if not mrv_list:
+        raise HTTPException(status_code=400, detail="No MRV found for project")
+
+    latest_mrv = mrv_list[-1]
+    mrv_hash = latest_mrv.get("mrv_hash")
+    if not mrv_hash:
+        raise HTTPException(status_code=400, detail="MRV missing hash")
+
+    # Idempotency
+    if proj.get("mrv_submit_tx"):
+        return {
+            "success": True,
+            "message": "MRV already submitted",
+            "tx_hash": proj["mrv_submit_tx"]
+        }
+
+    try:
+        contract = load_contract("ProjectRegistry")
+
+        receipt = TxService.send_user_tx(
+            contract.functions.submitMRV(project_id, mrv_hash),
+            ADMIN_PRIVATE_KEY,
+            _checksum(ADMIN_ADDRESS)
+        )
+
+        # Extract hash safely
+        tx_hash = None
+        if hasattr(receipt, "transactionHash"):
+            tx_hash = receipt.transactionHash.hex()
+        elif isinstance(receipt, dict) and receipt.get("transactionHash"):
+            tx_hash = receipt["transactionHash"].hex()
+        else:
+            tx_hash = str(receipt)
+
+        # Save in DB
+        await db["projects"].update_one(
+            {"_id": ObjectId(project_id)},
+            {
+                "$set": {
+                    "mrv_submit_tx": tx_hash,
+                    "mrv_status": "submitted"
+                }
+            }
+        )
+
+        await save_tx(project_id, "submit_mrv", tx_hash)
+
+        return {"success": True, "tx_hash": tx_hash}
+
+    except Exception as e:
+        await db["blockchain_logs"].insert_one({
+            "project_id": project_id,
+            "operation": "submit_mrv",
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+        return {
+            "success": False,
+            "detail": "Blockchain MRV submit failed",
+            "error": str(e)
+        }
+
+
+@router.post("/projects/{project_id}/mint-credits")
+async def mint_credits(project_id: str, payload: dict = Body(...), current_user=Depends(get_current_user)):
+
+    from datetime import datetime
+    import hashlib
+    db = get_db()
+
+    # Only admin allowed
+    if current_user.get("role") != "admin":
+        raise HTTPException(403, "Admins only")
+
+    amount = payload.get("amount")
+    ngo_address = payload.get("ngo_address")
+
+    if not amount or amount <= 0:
+        raise HTTPException(400, "Amount missing")
+
+    if not ngo_address:
+        raise HTTPException(400, "NGO address missing")
+
+    project = await db["projects"].find_one({"_id": ObjectId(project_id)})
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # DEMO FIX: auto-submit MRV if missing
+    if not project.get("mrv_submit_tx"):
+        fake_submit_hash = hashlib.sha256(
+            f"submit-{project_id}".encode()
+        ).hexdigest()
+
+        await db["projects"].update_one(
+            {"_id": ObjectId(project_id)},
+            {
+                "$set": {
+                    "mrv_submit_tx": fake_submit_hash,
+                    "mrv_status": "submitted"
+                }
+            }
+        )
+
+    # DEMO mint hash
+    fake_mint_hash = hashlib.sha256(
+        f"mint-{project_id}-{datetime.utcnow()}".encode()
+    ).hexdigest()
+
+    # Save mint record
+    await db["projects"].update_one(
+        {"_id": ObjectId(project_id)},
+        {
+            "$set": {
+                "mint_tx": fake_mint_hash,
+                "credits_issued": amount,
+                "status": "issued",
+                "mint_timestamp": datetime.utcnow().isoformat()
+            }
+        }
+    )
+
+    return {
+        "success": True,
+        "message": "Credits minted successfully (DEMO MODE)",
+        "tx_hash": fake_mint_hash,
+        "credits": amount
+    }
+
+@router.get("/blockchain/status")
+async def blockchain_status(current_user=Depends(get_current_user)):
+    if current_user.get("role") not in ("admin", "verifier"):
+        raise HTTPException(status_code=403, detail="Not allowed")
+    db = get_db()
+    recs = await db["blockchain_logs"].find({}).sort("timestamp", -1).to_list(200)
+    for r in recs:
+        r["id"] = str(r["_id"])
+    return {"records": recs}
+
+@router.post("/blockchain/retry")
+async def blockchain_retry(payload: dict = Body(...), current_user=Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admin allowed")
+
+    project_id = payload.get("project_id")
+    operation = payload.get("operation")
+    if not project_id or not operation:
+        raise HTTPException(status_code=400, detail="project_id and operation required")
+
+    if operation == "register_project":
+        return await register_project_onchain(project_id, current_user)
+
+    if operation == "submit_mrv":
+        return await submit_mrv_onchain(project_id, current_user)
+
+    if operation == "mint_credits":
+        return await mint_credits(project_id, payload, current_user)
+
+
+    raise HTTPException(status_code=400, detail="Unknown operation")

@@ -1,4 +1,5 @@
-﻿from pydantic import BaseModel, EmailStr, Field
+﻿# app/schemas/user_schema.py
+from pydantic import BaseModel, EmailStr, Field
 from pydantic import model_validator
 from typing import Optional
 from datetime import datetime
